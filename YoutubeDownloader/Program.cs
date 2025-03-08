@@ -1,158 +1,209 @@
 ﻿using System;
-using System.Collections;
-using YoutubeExplode;
-using YoutubeExplode.Common;
-using System.Linq;
-using System.Threading.Tasks;
-using System.Text;
-using YoutubeExplode.Playlists;
 using System.Collections.Generic;
 using System.IO;
-using YoutubeExplode.Videos;
-using System.Net;
-using System.Drawing;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using YoutubeExplode;
+using YoutubeExplode.Common;
+using YoutubeExplode.Playlists;
 using YoutubeExplode.Videos.Streams;
-using System.Reflection.PortableExecutable;
-using FFMpegCore;
-using FFMpegCore.Enums;
-
 namespace YoutubeDownloader
 {
-    // program for downloading a youtube playlist
     internal class Program
     {
+        static readonly char[] characters = Path.GetInvalidFileNameChars();
+        static int completedDownloads = 0;
+        static object lockObj = new object();
+        static DateTime startTime;
+
         // can't make the main async
         public static Task Main(string[] args) => new Program().MainAsync(args);
 
         public async Task MainAsync(string[] args)
         {
-            int test = 0;
-            if (args[1] == "all")
+            if (args.Length < 2)
             {
-                args[1] = "0";
+                Console.WriteLine("Usage: YoutubeDownloader <playlist-url> <limit|all> [low]");
+                return;
             }
-            if (!Int32.TryParse(args[1], out test))
+
+            int limit = 0;
+            if (args[1].ToLower() == "all")
             {
-                throw new ArgumentException("Second argument should be a whole number");
+                limit = 0; // 0 means all videos
             }
+            else if (!int.TryParse(args[1], out limit))
+            {
+                throw new ArgumentException("Second argument should be a whole number or 'all'");
+            }
+
             var youtube = new YoutubeClient();
-            var listOfAudio = new ArrayList();
-            // giving the playlist id
+
+            // Create downloads directory if it doesn't exist
+            string downloadDir = Path.Combine(Directory.GetCurrentDirectory(), "downloads");
+            if (!Directory.Exists(downloadDir))
+            {
+                Directory.CreateDirectory(downloadDir);
+            }
+
+            Console.WriteLine("Fetching playlist information...");
+
+            // Get videos from playlist
             IReadOnlyList<PlaylistVideo> videos;
-            if (Convert.ToInt32(args[1]) == 0)
+            if (limit == 0)
             {
-                 videos = await youtube.Playlists.GetVideosAsync(args[0]).CollectAsync();
-            }else
-            {
-                videos = await youtube.Playlists.GetVideosAsync(args[0]).CollectAsync(Convert.ToInt32(args[1]));
+                videos = await youtube.Playlists.GetVideosAsync(args[0]).CollectAsync();
             }
-            
-            foreach (var video in videos)
+            else
             {
-                var info = new ArrayList() { video.Url, video.Title };
-                listOfAudio.Add(info);
+                videos = await youtube.Playlists.GetVideosAsync(args[0]).CollectAsync(limit);
             }
-            #region downloads the video as an audio file
-            int counter = 0;
-            if (!Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), "downloads")))
-            {
-                Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), "downloads"));
-            }
-            DateTime start = DateTime.Now;
-            int max = listOfAudio.Count;
-            WebClient client = new WebClient();
-            foreach (ArrayList url in listOfAudio)
-            {
-                counter++;
 
-                if (!System.IO.File.Exists(Path.Combine(Directory.GetCurrentDirectory(), "downloads", RemoveSpecialCharacters(url[1].ToString()) + ".mp3")))
+            Console.WriteLine($"Found {videos.Count} videos in playlist");
+            Console.WriteLine("Starting downloads...");
+
+            startTime = DateTime.Now;
+
+            // Determine maximum degree of parallelism
+            int maxParallelDownloads = Environment.ProcessorCount * 2; // Adjust based on your needs
+
+            // Use a semaphore to limit concurrent downloads
+            using (var semaphore = new SemaphoreSlim(maxParallelDownloads, maxParallelDownloads))
+            {
+                bool useLowQuality = args.Length > 2 && args[2].ToLower() == "low";
+
+                // Create tasks for all videos
+                var downloadTasks = videos.Select(video => DownloadVideoAsync(
+                    youtube,
+                    video,
+                    downloadDir,
+                    useLowQuality,
+                    videos.Count,
+                    semaphore)).ToArray();
+
+                // Wait for all downloads to complete
+                await Task.WhenAll(downloadTasks);
+            }
+
+            Console.WriteLine("\nAll downloads completed!");
+            TimeSpan elapsedTime = DateTime.Now - startTime;
+            Console.WriteLine($"Total time: {elapsedTime.Hours}h {elapsedTime.Minutes}m {elapsedTime.Seconds}s");
+        }
+
+        private async Task DownloadVideoAsync(
+            YoutubeClient youtube,
+            PlaylistVideo video,
+            string downloadDir,
+            bool useLowQuality,
+            int totalCount,
+            SemaphoreSlim semaphore)
+        {
+            await semaphore.WaitAsync(); // Wait until we can download another video
+
+            try
+            {
+                string safeTitle = RemoveSpecialCharacters(video.Title);
+                string filePath = Path.Combine(downloadDir, safeTitle + ".mp3");
+
+                // Skip if already downloaded
+                if (File.Exists(filePath))
                 {
-                    #region sets up the audio downloading
-                    var manifest = await youtube.Videos.Streams.GetManifestAsync(url[0].ToString());
-                    var audioOptions = manifest.GetAudioStreams();
-                    #endregion
-                    List<IAudioStreamInfo> cleanList = new List<IAudioStreamInfo>();
-                    IAudioStreamInfo audioManifest;
-                    foreach (var audio in audioOptions)
-                    {
-                        if (audio.Container.Name == "mp4" || audio.Container.Name == "mp3")
-                        {
-                            cleanList.Add(audio);
-                        }
-                    }
-                    #region gets lower quality if there is a third parameter
-                    if (args.Length > 2 && args[2].ToString() == "low")
-                    {
-                        audioManifest = cleanList[cleanList.Count - 2];
-                    }
-                    #endregion
-                    #region gets the highest audio quality
-                    else
-                    {
-                        audioManifest=cleanList[cleanList.Count - 1];
+                    UpdateProgress(totalCount);
+                    return;
+                }
 
-                    }
-                    #endregion
+                // Get stream info
+                var manifest = await youtube.Videos.Streams.GetManifestAsync(video.Url);
+                var audioStreams = manifest.GetAudioStreams()
+                    .Where(a => a.Container.Name == "mp4" || a.Container.Name == "mp3")
+                    .ToList();
 
+                if (audioStreams.Count == 0)
+                {
+                    Console.WriteLine($"No suitable audio stream found for: {video.Title}");
+                    return;
+                }
 
-                    
-                    // saves the video to the path current directory and then downloads with the music video name
-
-
-                    await youtube.Videos.Streams.DownloadAsync(audioManifest, Path.Combine(Directory.GetCurrentDirectory(), "downloads", RemoveSpecialCharacters(url[1].ToString()) + "." + audioManifest.Container.Name));
-                    ConvertAudioFile(RemoveSpecialCharacters(url[1].ToString()) + "." + audioManifest.Container.Name);
-                    Console.WriteLine(Path.Combine(Directory.GetCurrentDirectory(), "downloads", RemoveSpecialCharacters(url[1].ToString()) + ".mp3") + ": "
-                       + Math.Round(Convert.ToDecimal(counter) / max * 100, 2) + "% done"
-                       + ", " + CalculateEstimatedDownloadTime(start, counter, max));
-                    
-
-                    
-
+                // Select audio quality
+                IAudioStreamInfo audioStream;
+                if (useLowQuality && audioStreams.Count > 1)
+                {
+                    audioStream = audioStreams[audioStreams.Count - 2];
                 }
                 else
                 {
-                    max -= counter;
-                    counter = 0;
-                    start = DateTime.Now;
+                    audioStream = audioStreams.Last();
                 }
-                
+
+                // Download the audio
+                await youtube.Videos.Streams.DownloadAsync(audioStream, filePath);
+
+                // Update and display progress
+                UpdateProgress(totalCount);
             }
-            #endregion
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error downloading {video.Title}: {ex.Message}");
+            }
+            finally
+            {
+                semaphore.Release(); // Release the semaphore so another download can start
+            }
         }
-        //removes the special character out of a string
+
+        private void UpdateProgress(int totalCount)
+        {
+            int current;
+            lock (lockObj)
+            {
+                completedDownloads++;
+                current = completedDownloads;
+            }
+
+            decimal percentage = Math.Round((decimal)current / totalCount * 100, 2);
+
+            string estimatedTimeLeft = "Calculating...";
+            if (current > 0)
+            {
+                estimatedTimeLeft = CalculateEstimatedTime(startTime, current, totalCount);
+            }
+
+            Console.WriteLine($"Progress: {current}/{totalCount} ({percentage}%) - {estimatedTimeLeft}");
+        }
+
+        // Removes special characters from a string
         public static string RemoveSpecialCharacters(string str)
         {
             StringBuilder sb = new StringBuilder();
             foreach (char c in str)
             {
-                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '.' || c == '_' || c == ' ')
+                if (!characters.Contains(c))
                 {
                     sb.Append(c);
                 }
             }
             return sb.ToString();
         }
-        public static string CalculateEstimatedDownloadTime(DateTime startTime, int countDone, int countTodo)
+
+        // Calculate estimated download time
+        public static string CalculateEstimatedTime(DateTime startTime, int countDone, int countTodo)
         {
-            DateTime now = DateTime.Now;
-            TimeSpan timeTaken = now.Subtract(startTime);
-            double totalMil = timeTaken.TotalMilliseconds;
-            double averageTimePerItem = (double)totalMil / countDone;
+            TimeSpan timeTaken = DateTime.Now - startTime;
+            double averageTimePerItem = timeTaken.TotalMilliseconds / countDone;
             double estimatedTimeLeft = (countTodo - countDone) * averageTimePerItem;
-            int estimatedHours = Convert.ToInt32(Math.Truncate(estimatedTimeLeft / (1000 * 60 * 60)));
-            estimatedTimeLeft = estimatedTimeLeft - estimatedHours * (1000 * 60 * 60);
-            int minutes = Convert.ToInt32(Math.Truncate(estimatedTimeLeft / (1000 * 60)));
-            estimatedTimeLeft = estimatedTimeLeft - minutes * (1000 * 60);
-            int seconds = Convert.ToInt32(Math.Truncate(estimatedTimeLeft / 1000 ));
-            return estimatedHours + " hours " + minutes + " minutes " + seconds + " seconds left";
-        }
-        public static async void ConvertAudioFile(string fileName)
-        {
-            await FFMpegArguments
-                        .FromFileInput(Path.Combine(Directory.GetCurrentDirectory(), "downloads", fileName))
-                        .OutputToFile(Path.Combine(Directory.GetCurrentDirectory(), "downloads", fileName.Split(".")[0] + ".mp3"), true)
-                        .ProcessAsynchronously();
-            File.Delete(Path.Combine(Directory.GetCurrentDirectory(), "downloads",fileName ));
+
+            // Convert to hours, minutes, seconds
+            int hours = (int)(estimatedTimeLeft / (1000 * 60 * 60));
+            estimatedTimeLeft -= hours * (1000 * 60 * 60);
+
+            int minutes = (int)(estimatedTimeLeft / (1000 * 60));
+            estimatedTimeLeft -= minutes * (1000 * 60);
+
+            int seconds = (int)(estimatedTimeLeft / 1000);
+
+            return $"{hours}h {minutes}m {seconds}s remaining";
         }
     }
 }

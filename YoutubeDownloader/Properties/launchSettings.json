@@ -2,7 +2,7 @@
   "profiles": {
     "YoutubeDownloader": {
       "commandName": "Project",
-      "commandLineArgs": "\"https://www.youtube.com/watch?v=UjrA3l1at9c&list=PLNDNYulDrpwS1KRAhfRFj9sThTzBUWKlB\" \"all\" \"low\" \"art\""
+      "commandLineArgs": "\"https://www.youtube.com/playlist?list=PLewAP9xUTx3-UZWF65VNtADrMOQLwgAU1\" \"all\" \"low\" \"art\""
     }
   }
 }
